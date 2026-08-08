@@ -1,0 +1,16 @@
+name: knowledge-ratchet
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - numpy>=1.24
+  - scipy>=1.10
+  - matplotlib>=3.7
+  - pandas>=2.0
+  - pip
+  - pip:
+      # optional, only for validate_guacamol.py --guacamol
+      # - rdkit
+      # - guacamol
+      # - scikit-learn
+      - jupyter
