@@ -1,230 +1,123 @@
 """
-simulate.py - Main simulation script for SAPE and baselines.
-
-Reproduces Figures 2-5 from the paper:
-- Figure 2: Parameter sensitivity
-- Figure 3: Multi-baseline comparison
-- Figure 4: Catastrophic forgetting dynamics
-- Figure 5: Ablation studies
+simulate.py — Reproduce Table 2 (multi-baseline comparison) and the
+forgetting / ablation headline numbers of Yan (2026), "The Knowledge Ratchet".
 
 Usage:
-    python simulate.py --figure all --n_runs 10000 --output_dir figures/
+    python simulate.py                 # full run (Table 2 + forgetting + ablations)
+    python simulate.py --quick         # reduced run counts for a fast smoke test
+    python simulate.py --out results/  # write JSON summary
+
+Expected output (full run, paper values):
+    S4AI (full model)        2,812  (SE 0.5)
+    Oracle threshold policy  2,046
+    TuRBO-1                  1,919  (SE 6.2)
+    GP-UCB                   1,472  (SE 24.6)
+    Periodic (tau=10)        1,275
+    Online CL                1,239
+    No learning              1,067
+    Random                     650
 """
 
-import numpy as np
-import matplotlib.pyplot as plt
-from pathlib import Path
 import argparse
 import json
-from sapelib import SAPEParams, SAPESimulator, run_fixed_capability, run_periodic_retraining
+from pathlib import Path
+
+import numpy as np
+
+from knowledge_ratchet import (Params, run_s4ai, run_nolearn, run_random,
+                               run_periodic, run_online_cl, run_gp_ucb,
+                               run_turbo1, run_oracle_threshold)
 
 
-def figure_parameter_sensitivity(output_dir: Path, n_runs: int = 10000):
-    """Figure 2: Parameter sensitivity analysis."""
-    print("Generating Figure 2: Parameter sensitivity...")
-    
-    baseline = SAPEParams()
-    n_rounds = 100
-    
-    params_to_vary = {
-        'p_max': np.linspace(0.6, 0.95, 8),
-        'eta_0': np.linspace(0.01, 0.06, 8),
-        'gamma_0': np.linspace(0.05, 0.35, 8),
-        'alpha_0': np.linspace(0.45, 0.85, 8),
-        'lambda_CF': np.linspace(0.0, 0.3, 8),
-    }
-    
-    fig, axes = plt.subplots(1, 5, figsize=(20, 4))
-    
-    for idx, (param_name, values) in enumerate(params_to_vary.items()):
-        slopes = []
-        conv_times = []
-        
-        for v in values:
-            p = SAPEParams(**{**baseline.__dict__, param_name: v})
-            mc = SAPESimulator(p).run_monte_carlo(n_rounds, n_runs=min(n_runs, 1000))
-            
-            # Long-run slope (last 20 rounds)
-            slope = (mc['K_mean'][-1] - mc['K_mean'][-21]) / 20
-            slopes.append(slope)
-            
-            # Convergence time (theta within 1% of ceiling)
-            conv_mask = mc['theta_mean'] >= 0.99 * p.theta_bar
-            conv_time = np.argmax(conv_mask) if conv_mask.any() else n_rounds
-            conv_times.append(conv_time)
-        
-        ax = axes[idx]
-        ax2 = ax.twinx()
-        
-        l1 = ax.plot(values, slopes, 'o-', color='#2E86AB', label='Growth slope', markersize=4)
-        l2 = ax2.plot(values, conv_times, 's--', color='#A23B72', label='Conv. time', markersize=4)
-        
-        ax.set_xlabel(param_name, fontsize=10)
-        ax.set_ylabel('Slope (discoveries/round)', color='#2E86AB', fontsize=9)
-        ax2.set_ylabel('Conv. time (rounds)', color='#A23B72', fontsize=9)
-        ax.set_title(param_name, fontsize=11, fontweight='bold')
-        ax.tick_params(axis='y', labelcolor='#2E86AB', labelsize=8)
-        ax2.tick_params(axis='y', labelcolor='#A23B72', labelsize=8)
-        ax.tick_params(axis='x', labelsize=8)
-        ax.grid(alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig(output_dir / 'figure2_parameter_sensitivity.png', dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"  Saved to {output_dir / 'figure2_parameter_sensitivity.png'}")
+def table2(quick=False):
+    R = 1_000 if quick else 10_000
+    Rbo = 50 if quick else 200
+    rows = {}
+    rows["S4AI"] = run_s4ai(R=R, ret_traj=True)
+    rows["Oracle threshold"] = run_oracle_threshold(R=R)
+    rows["TuRBO-1"] = run_turbo1(R=Rbo)
+    rows["GP-UCB"] = run_gp_ucb(R=Rbo)
+    rows["Periodic (tau=10)"] = run_periodic(R=R)
+    rows["Online CL"] = run_online_cl(R=R)
+    rows["No learning"] = run_nolearn(R=R)
+    rows["Random"] = run_random(R=R)
+    return rows
 
 
-def figure_multi_baseline(output_dir: Path, n_runs: int = 10000):
-    """Figure 3: Multi-baseline comparison."""
-    print(f"Generating Figure 3: Multi-baseline comparison (n_runs={n_runs})...")
-    
-    n_rounds = 100
-    M = 50
-    baseline = SAPEParams(M=M)
-    
-    methods = {
-        'SAPE': lambda p, n: SAPESimulator(p).run_monte_carlo(n, n_runs),
-        'Fixed-capability': lambda p, n: monte_carlo_wrapper(
-            lambda p, n: run_fixed_capability(p, n), p, n, n_runs),
-        'Periodic-retrain (tau=10)': lambda p, n: monte_carlo_wrapper(
-            lambda p, n: run_periodic_retraining(p, n, tau=10), p, n, n_runs),
-    }
-    
-    colors = {'SAPE': '#E63946', 'Fixed-capability': '#457B9D', 
-              'Periodic-retrain (tau=10)': '#2A9D8F'}
-    
-    fig, ax = plt.subplots(figsize=(8, 5))
-    
-    for name, func in methods.items():
-        print(f"  Running {name}...")
-        mc = func(baseline, n_rounds)
-        rounds = np.arange(n_rounds + 1)
-        ax.plot(rounds, mc['K_mean'], color=colors[name], label=name, linewidth=2)
-        ax.fill_between(rounds, 
-                        mc['K_mean'] - mc['K_se'],
-                        mc['K_mean'] + mc['K_se'],
-                        alpha=0.2, color=colors[name])
-    
-    ax.set_xlabel('Round t', fontsize=12)
-    ax.set_ylabel('Cumulative knowledge stock K_t', fontsize=12)
-    ax.set_title('Multi-baseline comparison (M=50)', fontsize=13, fontweight='bold')
-    ax.legend(fontsize=10)
-    ax.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(output_dir / 'figure3_multi_baseline.png', dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"  Saved to {output_dir / 'figure3_multi_baseline.png'}")
+def forgetting(quick=False):
+    T, R = (300, 500) if quick else (1000, 2000)
+    base = run_s4ai(T=T, R=R)
+    forg = run_s4ai(T=T, R=R, par=Params(lambda_CF=0.035, delta_CF=0.3))
+    lo = slice(T // 2, T)
+    s_b = np.polyfit(np.arange(T // 2, T), base["K_mean"][lo], 1)[0]
+    s_f = np.polyfit(np.arange(T // 2, T), forg["K_mean"][lo], 1)[0]
+    return {"slope_no_forgetting": float(s_b), "slope_forgetting": float(s_f),
+            "degradation_pct": float(100 * (1 - s_f / s_b))}
 
 
-def figure_catastrophic_forgetting(output_dir: Path, n_runs: int = 1000):
-    """Figure 4: Catastrophic forgetting dynamics."""
-    print("Generating Figure 4: Catastrophic forgetting...")
-    
-    params = SAPEParams(lambda_CF=0.1, delta_CF=0.3, seed=42)
-    n_rounds = 1000
-    
-    sim = SAPESimulator(params)
-    hist = sim.run_episode(n_rounds)
-    
-    fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
-    
-    rounds = np.arange(n_rounds + 1)
-    
-    # Capability index
-    axes[0].plot(rounds, hist['theta'], color='#E63946', linewidth=1)
-    axes[0].set_ylabel('Capability index θ_t', fontsize=11)
-    axes[0].set_title('Catastrophic forgetting dynamics (λ_CF=0.1, δ_CF=0.3)', 
-                      fontsize=12, fontweight='bold')
-    axes[0].grid(alpha=0.3)
-    
-    # Knowledge stock
-    axes[1].plot(rounds, hist['K'], color='#2A9D8F', linewidth=1.5)
-    axes[1].set_ylabel('Knowledge stock K_t', fontsize=11)
-    axes[1].set_xlabel('Round t', fontsize=12)
-    axes[1].grid(alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig(output_dir / 'figure4_forgetting.png', dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"  Saved to {output_dir / 'figure4_forgetting.png'}")
-
-
-def figure_ablation(output_dir: Path, n_runs: int = 5000):
-    """Figure 5: Ablation studies."""
-    print(f"Generating Figure 5: Ablation studies (n_runs={n_runs})...")
-    
-    n_rounds = 100
-    configs = {
-        'SAPE-full': SAPEParams(),
-        'SAPE-K-only': SAPEParams(eta_0=0.0),
-        'SAPE-periodic': SAPEParams(),  # simulated separately
-        'SAPE-no-learning': SAPEParams(eta_0=0.0, gamma_0=0.0),
-    }
-    
-    colors = {'SAPE-full': '#E63946', 'SAPE-K-only': '#457B9D',
-              'SAPE-periodic': '#F4A261', 'SAPE-no-learning': '#2A9D8F'}
-    
-    fig, ax = plt.subplots(figsize=(8, 5))
-    
-    for name, p in configs.items():
-        print(f"  Running {name}...")
-        mc = SAPESimulator(p).run_monte_carlo(n_rounds, n_runs)
-        rounds = np.arange(n_rounds + 1)
-        ax.plot(rounds, mc['K_mean'], color=colors[name], label=name, linewidth=2)
-        ax.fill_between(rounds,
-                        mc['K_mean'] - mc['K_se'],
-                        mc['K_mean'] + mc['K_se'],
-                        alpha=0.2, color=colors[name])
-    
-    ax.set_xlabel('Round t', fontsize=12)
-    ax.set_ylabel('Cumulative knowledge stock K_t', fontsize=12)
-    ax.set_title('Ablation studies', fontsize=13, fontweight='bold')
-    ax.legend(fontsize=10)
-    ax.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(output_dir / 'figure5_ablation.png', dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"  Saved to {output_dir / 'figure5_ablation.png'}")
-
-
-def monte_carlo_wrapper(fn, params, n_rounds, n_runs):
-    """Helper for baselines without built-in MC."""
-    all_K = np.zeros((n_runs, n_rounds + 1))
-    for i in range(n_runs):
-        p = SAPEParams(**{**params.__dict__, 'seed': i})
-        hist = fn(p, n_rounds)
-        all_K[i] = hist['K']
-    return {
-        'K_mean': all_K.mean(axis=0),
-        'K_se': all_K.std(axis=0) / np.sqrt(n_runs),
-        'theta_mean': np.zeros(n_rounds + 1),  # Not tracked for baselines
-    }
+def ablations(quick=False):
+    R = 1_000 if quick else 10_000
+    out = {}
+    base = run_s4ai(R=R)["K_final"]
+    out["baseline"] = base
+    for kap in (0.1, 0.2):
+        p = Params(zeta_0=0.05, kappa=kap)
+        out[f"pruning_kappa_{kap}"] = run_s4ai(R=R, par=p)["K_final"]
+    for rd in (0.01, 0.05, 0.10, 0.20):
+        p = Params(rho_d=rd)
+        out[f"reversible_rho_d_{rd}"] = run_s4ai(R=R, par=p)["K_final"]
+    p = Params(lambda_CF=0.035, delta_CF=0.3, rho_d=0.05, rho_f=0.3)
+    rev = run_s4ai(R=R, par=p)
+    out["reversible_under_forgetting"] = rev["K_final"]
+    # late-window net rates (paper Ablation 3: 28.0 vs 2.2 discoveries/round)
+    irr = run_s4ai(R=R, par=Params(lambda_CF=0.035, delta_CF=0.3))
+    lo = slice(50, 100)
+    t = np.arange(50, 100)
+    out["rate_irreversible_under_forgetting"] = float(
+        np.polyfit(t, irr["K_mean"][lo], 1)[0])
+    out["rate_reversible_under_forgetting"] = float(
+        np.polyfit(t, rev["K_mean"][lo], 1)[0])
+    return out
 
 
 def main():
-    parser = argparse.ArgumentParser(description='SAPE Simulation Suite')
-    parser.add_argument('--figure', type=str, default='all',
-                       choices=['all', '2', '3', '4', '5'],
-                       help='Which figure to generate')
-    parser.add_argument('--n_runs', type=int, default=10000,
-                       help='Number of Monte Carlo runs')
-    parser.add_argument('--output_dir', type=str, default='figures',
-                       help='Output directory for figures')
-    args = parser.parse_args()
-    
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(exist_ok=True)
-    
-    if args.figure in ('all', '2'):
-        figure_parameter_sensitivity(output_dir, args.n_runs)
-    if args.figure in ('all', '3'):
-        figure_multi_baseline(output_dir, args.n_runs)
-    if args.figure in ('all', '4'):
-        figure_catastrophic_forgetting(output_dir, min(args.n_runs, 1000))
-    if args.figure in ('all', '5'):
-        figure_ablation(output_dir, min(args.n_runs, 5000))
-    
-    print(f"\nAll figures saved to {output_dir}/")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--quick", action="store_true")
+    ap.add_argument("--out", type=str, default=None)
+    args = ap.parse_args()
+
+    print("=== Table 2: relative productivity (mean K_100) ===")
+    rows = table2(args.quick)
+    s4 = rows["S4AI"]["K_final"]
+    for name, r in rows.items():
+        se = r.get("K_se", float("nan"))
+        print(f"{name:<22} {r['K_final']:>8.1f}  (SE {se:5.2f})  "
+              f"S4AI advantage {s4 / r['K_final']:.2f}x")
+
+    print("\n=== Forgetting (lambda_CF=0.035, delta_CF=0.3) ===")
+    f = forgetting(args.quick)
+    print(f"slope {f['slope_forgetting']:.2f} vs {f['slope_no_forgetting']:.2f} "
+          f"discoveries/round ({f['degradation_pct']:.1f}% degradation)")
+
+    print("\n=== Ablations (mean K_100) ===")
+    ab = ablations(args.quick)
+    for k, v in ab.items():
+        print(f"{k:<36} {v:>8.1f}")
+
+    if args.out:
+        out = Path(args.out)
+        out.mkdir(exist_ok=True)
+        def slim(d):
+            return {k: (float(v) if np.isscalar(v) else None)
+                    for k, v in d.items()}
+        payload = {
+            "table2": {k: slim(v) for k, v in rows.items()},
+            "forgetting": f,
+            "ablations": ab,
+        }
+        with open(out / "simulation_results.json", "w") as fh:
+            json.dump(payload, fh, indent=2)
+        print(f"\nSaved {out / 'simulation_results.json'}")
 
 
 if __name__ == "__main__":
